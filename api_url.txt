@@ -1,2 +1,1 @@
-https://replace-with-your-render-url.onrender.com
-
+https://course-registration-api-mf5g.onrender.com
