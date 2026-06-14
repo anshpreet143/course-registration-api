@@ -1,18 +1,16 @@
-# Project Part 1: Environment Setup and Catalog Ingestion
+# Course Registration API
 
 **Student Name:** Sukhveer Kaur  
 **Student ID:** 5147346  
 **Course:** ITEC3706 S01 - Software Engineering  
 **Institution:** Algoma University - Sault Ste. Marie
 
-This is the corrected Project Part 1 submission for the Moodle/VPL requirement:
+This repository contains the FastAPI service used for the course project.
 
-- `main.py`
-- `api_url.txt`
+- Part 1 ingests an HTML course catalog and exposes course lookup.
+- Part 2 ingests one student's messy transcript HTML, stores planned courses, and returns a unified profile.
 
-The API ingests an HTML course catalog, parses the course table into structured records, and exposes a lookup endpoint for individual courses.
-
-## Required Endpoints
+## Part 1 Endpoints
 
 ### Import Catalog
 
@@ -112,3 +110,104 @@ Do not include a trailing slash or endpoint path.
 
 Before submitting to Moodle/VPL, open the Render URL in a browser and wait for the server to wake up.
 
+## Part 2 Endpoints
+
+All Part 2 routes use this prefix:
+
+```text
+/api/v1/students/{student_id}
+```
+
+### Import Student History
+
+```text
+POST /api/v1/students/{student_id}/history/import
+```
+
+Requirements:
+
+- Accepts `multipart/form-data`.
+- File field name must be `file`.
+- Uploaded file is a transcript HTML export.
+- A student exists after history import creates the profile.
+- Response is `201 Created`.
+
+Local test:
+
+```bash
+curl -F "file=@student-example.html;type=text/html" \
+  http://localhost:8000/api/v1/students/111/history/import
+```
+
+### Replace Or Clear History
+
+```text
+PUT /api/v1/students/{student_id}/history
+DELETE /api/v1/students/{student_id}/history
+```
+
+`PUT` expects:
+
+```json
+{
+  "history": [
+    {
+      "course_code": "COSC-1046",
+      "term": "23F",
+      "credits_earned": 3,
+      "status": "Completed"
+    }
+  ]
+}
+```
+
+### Store Or Clear Plan
+
+```text
+POST /api/v1/students/{student_id}/plan
+PUT /api/v1/students/{student_id}/plan
+DELETE /api/v1/students/{student_id}/plan
+```
+
+`POST` and `PUT` expect:
+
+```json
+{
+  "planned_courses": [
+    {
+      "course_code": "COSC-3506",
+      "term": "26F"
+    }
+  ]
+}
+```
+
+### Get Unified Profile
+
+```text
+GET /api/v1/students/{student_id}/profile
+```
+
+The response contains exactly these top-level keys:
+
+```json
+{
+  "student_id": "111",
+  "history": [
+    {
+      "course_code": "COSC-1046",
+      "term": "23F",
+      "credits_earned": 3,
+      "status": "Completed"
+    }
+  ],
+  "plan": [
+    {
+      "course_code": "COSC-3506",
+      "term": "26F"
+    }
+  ]
+}
+```
+
+Unknown students return `404` for history lifecycle, plan, and profile routes.
