@@ -427,7 +427,7 @@ def completed_history_by_code(history: list[PastCourse]) -> dict[str, PastCourse
 
     completed: dict[str, PastCourse] = {}
     for course in history:
-        if course.status != "Completed":
+        if course.status.lower() != "completed":
             continue
 
         key = normalize_course_code(course.course_code)
@@ -523,29 +523,92 @@ def build_cross_list_violations(
     """Detect planned courses that duplicate already completed cross-listed credit."""
 
     violations: list[dict[str, str]] = []
+    seen_pairs: set[tuple[str, str]] = set()
 
     for planned in plan:
         catalog_course = catalog_record_for(planned.course_code)
-        if catalog_course is None:
-            continue
+        cross_listed_courses: list[str] = []
 
-        cross_listed_courses = extract_course_codes(str(catalog_course["cross_listed"]))
+        if catalog_course is not None:
+            cross_listed_courses.extend(
+                extract_course_codes(str(catalog_course["cross_listed"]))
+            )
+
+        planned_key = normalize_course_code(planned.course_code)
+        for completed_course in completed_courses.values():
+            completed_catalog = catalog_record_for(completed_course.course_code)
+            if completed_catalog is None:
+                continue
+
+            reverse_cross_listed = extract_course_codes(
+                str(completed_catalog["cross_listed"])
+            )
+            if any(
+                normalize_course_code(code) == planned_key
+                for code in reverse_cross_listed
+            ):
+                cross_listed_courses.append(completed_course.course_code)
+
         for cross_listed in cross_listed_courses:
             completed = completed_courses.get(normalize_course_code(cross_listed))
             if completed is None:
                 continue
+
+            pair_key = (
+                normalize_course_code(planned.course_code),
+                normalize_course_code(completed.course_code),
+            )
+            if pair_key in seen_pairs:
+                continue
+            seen_pairs.add(pair_key)
 
             violations.append(
                 {
                     "course_code": planned.course_code,
                     "type": "CROSS_LIST_CONFLICT",
                     "message": (
-                        "Cross-listed with completed course " f"{completed.course_code}"
+                        "Cross-listed with completed course "
+                        f"{format_course_code_for_message(completed.course_code)}"
                     ),
                 }
             )
 
     return violations
+
+
+def already_counted_cross_list(
+    course: PastCourse,
+    counted_courses: list[PastCourse],
+) -> bool:
+    """Check if an equivalent completed cross-listed course is already counted."""
+
+    course_catalog = catalog_record_for(course.course_code)
+    course_cross_listed = (
+        extract_course_codes(str(course_catalog["cross_listed"]))
+        if course_catalog is not None
+        else []
+    )
+    course_key = normalize_course_code(course.course_code)
+
+    for counted in counted_courses:
+        counted_catalog = catalog_record_for(counted.course_code)
+        counted_cross_listed = (
+            extract_course_codes(str(counted_catalog["cross_listed"]))
+            if counted_catalog is not None
+            else []
+        )
+        counted_key = normalize_course_code(counted.course_code)
+
+        if any(
+            normalize_course_code(code) == counted_key for code in course_cross_listed
+        ):
+            return True
+        if any(
+            normalize_course_code(code) == course_key for code in counted_cross_listed
+        ):
+            return True
+
+    return False
 
 
 def calculate_credit_summary(
@@ -554,7 +617,15 @@ def calculate_credit_summary(
 ) -> dict[str, int]:
     """Calculate earned, planned, and remaining credits for graduation."""
 
-    total_earned = sum(course.credits_earned for course in completed_courses.values())
+    total_earned = 0
+    counted_courses: list[PastCourse] = []
+
+    for course in sorted(completed_courses.values(), key=lambda item: item.course_code):
+        if already_counted_cross_list(course, counted_courses):
+            continue
+        counted_courses.append(course)
+        total_earned += course.credits_earned
+
     total_planned = 0
 
     for planned in plan:

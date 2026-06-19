@@ -188,3 +188,51 @@ def test_audit_report_ok_when_rules_are_satisfied() -> None:
         "total_planned": 3,
         "total_remaining_for_graduation": 111,
     }
+
+
+def test_audit_report_detects_reverse_cross_list_and_does_not_double_count() -> None:
+    reset_state()
+    import_catalog(
+        """
+        <table>
+          <tr>
+            <th>Course Code</th><th>Title</th><th>Credits</th>
+            <th>Prerequisites</th><th>Cross-listed</th>
+          </tr>
+          <tr><td>COSC 3506</td><td>Software Engineering</td><td>3</td><td></td><td>ITEC 3506</td></tr>
+          <tr><td>ITEC 3506</td><td>Software Engineering</td><td>3</td><td></td><td></td></tr>
+        </table>
+        """
+    )
+    create_student(
+        "770003",
+        [
+            {
+                "course_code": "COSC-3506",
+                "term": "26W",
+                "credits_earned": 3,
+                "status": "Completed",
+            },
+            {
+                "course_code": "ITEC-3506",
+                "term": "26W",
+                "credits_earned": 3,
+                "status": "Completed",
+            },
+        ],
+    )
+    client.post(
+        "/api/v1/students/770003/plan",
+        json={"planned_courses": [{"course_code": "ITEC-3506", "term": "26F"}]},
+    )
+
+    response = client.get("/api/v1/students/770003/auditreport")
+    assert response.status_code == 200, response.json()
+    assert response.json()["cross_list_violations"] == [
+        {
+            "course_code": "ITEC-3506",
+            "type": "CROSS_LIST_CONFLICT",
+            "message": "Cross-listed with completed course COSC-3506",
+        }
+    ]
+    assert response.json()["credit_summary"]["total_earned"] == 3
