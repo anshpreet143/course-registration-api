@@ -99,7 +99,7 @@ def test_audit_report_detects_missing_prerequisites_cross_lists_and_credits() ->
     )
     assert plan.status_code == 200, plan.json()
 
-    response = client.get("/api/v1/students/770001/auditreport")
+    response = client.get("/api/v1/students/770001/audit-report")
     assert response.status_code == 200, response.json()
     body = response.json()
 
@@ -137,7 +137,7 @@ def test_audit_report_detects_missing_prerequisites_cross_lists_and_credits() ->
         "total_remaining_for_graduation": 105,
     }
 
-    strict_response = client.get("/api/v1/students/770001/auditreport?strict=true")
+    strict_response = client.get("/api/v1/students/770001/audit-report?strict=true")
     assert strict_response.status_code == 200, strict_response.json()
     assert strict_response.json()["status"] == "failed"
 
@@ -178,7 +178,7 @@ def test_audit_report_ok_when_rules_are_satisfied() -> None:
         json={"planned_courses": [{"course_code": "COSC-3127", "term": "26F"}]},
     )
 
-    response = client.get("/api/v1/students/770002/auditreport?strict=true")
+    response = client.get("/api/v1/students/770002/audit-report?strict=true")
     assert response.status_code == 200, response.json()
     assert response.json()["status"] == "ok"
     assert response.json()["timeline_validation"] == []
@@ -226,7 +226,7 @@ def test_audit_report_detects_reverse_cross_list_and_does_not_double_count() -> 
         json={"planned_courses": [{"course_code": "ITEC-3506", "term": "26F"}]},
     )
 
-    response = client.get("/api/v1/students/770003/auditreport")
+    response = client.get("/api/v1/students/770003/audit-report")
     assert response.status_code == 200, response.json()
     assert response.json()["cross_list_violations"] == [
         {

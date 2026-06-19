@@ -41,5 +41,5 @@ jobs:
           curl --fail -X POST http://127.0.0.1:8000/api/v1/students/ci-student/plan \
             -H "Content-Type: application/json" \
             -d '{"planned_courses":[{"course_code":"COSC-3506","term":"26F"}]}'
-          curl --fail http://127.0.0.1:8000/api/v1/students/ci-student/auditreport
+          curl --fail http://127.0.0.1:8000/api/v1/students/ci-student/audit-report
           kill $SERVER_PID

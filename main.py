@@ -651,7 +651,7 @@ def root() -> dict[str, Any]:
         "import_endpoint": "/api/v1/admin/catalog/import",
         "lookup_endpoint": "/api/v1/catalog/courses/{course_code}",
         "student_profile_endpoint": "/api/v1/students/{student_id}/profile",
-        "audit_report_endpoint": "/api/v1/students/{student_id}/auditreport",
+        "audit_report_endpoint": "/api/v1/students/{student_id}/audit-report",
     }
 
 
@@ -783,6 +783,7 @@ def get_student_profile(student_id: str) -> dict[str, Any]:
     }
 
 
+@app.get("/api/v1/students/{student_id}/audit-report")
 @app.get("/api/v1/students/{student_id}/auditreport")
 def get_audit_report(student_id: str, strict: bool = False) -> dict[str, Any]:
     """Return the Phase 3 academic audit report for one student."""
