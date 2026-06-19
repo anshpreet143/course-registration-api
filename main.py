@@ -1,4 +1,4 @@
-"""Course registration API for Project Parts 1 and 2.
+"""Course registration API for Project Parts 1, 2, and 3.
 
 Student Name: Sukhveer Kaur
 Student ID: 5147346
@@ -38,6 +38,13 @@ Part 2:
 2. History, plan, and profile endpoints
    - PUT/DELETE history and POST/PUT/DELETE plan update a known student.
    - GET /profile returns exactly student_id, history, and plan.
+
+Part 3:
+
+1. GET /api/v1/students/{student_id}/auditreport
+   - Checks planned courses against prerequisite timing rules.
+   - Reports cross-listed courses that would duplicate completed credit.
+   - Calculates earned, planned, and remaining graduation credits.
 """
 
 from __future__ import annotations
@@ -404,6 +411,165 @@ def get_existing_student(student_id: str) -> StudentProfile:
     return student
 
 
+def parse_term_order(term: str) -> tuple[int, int]:
+    """Convert terms like 23F and 26SP into sortable values."""
+
+    match = re.fullmatch(r"(\d{2})(W|SP|S|F)", clean_text(term).upper())
+    if match is None:
+        return (9999, 9999)
+
+    season_order = {"W": 1, "SP": 2, "S": 3, "F": 4}
+    return (int(match.group(1)), season_order[match.group(2)])
+
+
+def completed_history_by_code(history: list[PastCourse]) -> dict[str, PastCourse]:
+    """Keep one completed record per course, using the latest completed term."""
+
+    completed: dict[str, PastCourse] = {}
+    for course in history:
+        if course.status != "Completed":
+            continue
+
+        key = normalize_course_code(course.course_code)
+        current = completed.get(key)
+        if current is None:
+            completed[key] = course
+            continue
+
+        if parse_term_order(course.term) > parse_term_order(current.term):
+            completed[key] = course
+        elif parse_term_order(course.term) == parse_term_order(current.term):
+            if course.credits_earned > current.credits_earned:
+                completed[key] = course
+
+    return completed
+
+
+def extract_course_codes(value: str) -> list[str]:
+    """Extract course-code-like tokens from prerequisite or cross-list text."""
+
+    if clean_text(value).lower() in {"", "none", "n/a", "na"}:
+        return []
+
+    matches = re.findall(r"\b[A-Za-z]{3,5}[-\s]?\d{4}\b", value)
+    return [format_course_code_for_message(match) for match in matches]
+
+
+def format_course_code_for_message(course_code: str) -> str:
+    """Format matched course codes consistently for audit messages."""
+
+    normalized = normalize_course_code(course_code)
+    match = re.fullmatch(r"([A-Z]{3,5})(\d{4})", normalized)
+    if match is None:
+        return clean_text(course_code).upper()
+    return f"{match.group(1)}-{match.group(2)}"
+
+
+def catalog_record_for(course_code: str) -> CourseRecord | None:
+    """Find a catalog record using format-insensitive course-code matching."""
+
+    return catalog_by_normalized_code.get(normalize_course_code(course_code))
+
+
+def has_completed_before(
+    completed_courses: dict[str, PastCourse],
+    course_code: str,
+    planned_term: str,
+) -> bool:
+    """Check if a prerequisite was completed in a strictly earlier term."""
+
+    completed = completed_courses.get(normalize_course_code(course_code))
+    if completed is None:
+        return False
+    return parse_term_order(completed.term) < parse_term_order(planned_term)
+
+
+def build_timeline_validation(
+    plan: list[PlannedCourse],
+    completed_courses: dict[str, PastCourse],
+) -> list[dict[str, Any]]:
+    """Build grouped missing-prerequisite errors ordered by planned term."""
+
+    errors_by_term: dict[str, list[dict[str, str]]] = {}
+
+    for planned in plan:
+        catalog_course = catalog_record_for(planned.course_code)
+        if catalog_course is None:
+            continue
+
+        prerequisites = extract_course_codes(str(catalog_course["prerequisites"]))
+        for prerequisite in prerequisites:
+            if has_completed_before(completed_courses, prerequisite, planned.term):
+                continue
+
+            errors_by_term.setdefault(planned.term, []).append(
+                {
+                    "course_code": planned.course_code,
+                    "type": "MISSING_PREREQUISITE",
+                    "message": f"Missing prerequisite: {prerequisite}",
+                }
+            )
+
+    return [
+        {"term": term, "errors": errors_by_term[term]}
+        for term in sorted(errors_by_term, key=parse_term_order)
+    ]
+
+
+def build_cross_list_violations(
+    plan: list[PlannedCourse],
+    completed_courses: dict[str, PastCourse],
+) -> list[dict[str, str]]:
+    """Detect planned courses that duplicate already completed cross-listed credit."""
+
+    violations: list[dict[str, str]] = []
+
+    for planned in plan:
+        catalog_course = catalog_record_for(planned.course_code)
+        if catalog_course is None:
+            continue
+
+        cross_listed_courses = extract_course_codes(str(catalog_course["cross_listed"]))
+        for cross_listed in cross_listed_courses:
+            completed = completed_courses.get(normalize_course_code(cross_listed))
+            if completed is None:
+                continue
+
+            violations.append(
+                {
+                    "course_code": planned.course_code,
+                    "type": "CROSS_LIST_CONFLICT",
+                    "message": (
+                        "Cross-listed with completed course " f"{completed.course_code}"
+                    ),
+                }
+            )
+
+    return violations
+
+
+def calculate_credit_summary(
+    plan: list[PlannedCourse],
+    completed_courses: dict[str, PastCourse],
+) -> dict[str, int]:
+    """Calculate earned, planned, and remaining credits for graduation."""
+
+    total_earned = sum(course.credits_earned for course in completed_courses.values())
+    total_planned = 0
+
+    for planned in plan:
+        catalog_course = catalog_record_for(planned.course_code)
+        if catalog_course is None:
+            continue
+        total_planned += int(catalog_course["credits"])
+
+    return {
+        "total_earned": total_earned,
+        "total_planned": total_planned,
+        "total_remaining_for_graduation": max(0, 120 - total_earned - total_planned),
+    }
+
+
 @app.get("/")
 def root() -> dict[str, Any]:
     """Simple reachability endpoint for Render/browser wake-up."""
@@ -414,6 +580,7 @@ def root() -> dict[str, Any]:
         "import_endpoint": "/api/v1/admin/catalog/import",
         "lookup_endpoint": "/api/v1/catalog/courses/{course_code}",
         "student_profile_endpoint": "/api/v1/students/{student_id}/profile",
+        "audit_report_endpoint": "/api/v1/students/{student_id}/auditreport",
     }
 
 
@@ -434,7 +601,9 @@ async def import_catalog(file: UploadFile = File(...)) -> dict[str, Any]:
 
     catalog_by_normalized_code.clear()
     for course in courses:
-        catalog_by_normalized_code[normalize_course_code(str(course["course_code"]))] = course
+        catalog_by_normalized_code[
+            normalize_course_code(str(course["course_code"]))
+        ] = course
 
     return {"imported": len(courses)}
 
@@ -462,15 +631,21 @@ def get_course(course_code: str) -> JSONResponse:
     "/api/v1/students/{student_id}/history/import",
     status_code=status.HTTP_201_CREATED,
 )
-async def import_student_history(student_id: str, file: UploadFile = File(...)) -> dict[str, Any]:
+async def import_student_history(
+    student_id: str, file: UploadFile = File(...)
+) -> dict[str, Any]:
     """Import one student's transcript HTML and create or replace their history."""
 
     raw = await file.read()
     if not raw:
-        raise HTTPException(status_code=400, detail="Uploaded transcript file is empty.")
+        raise HTTPException(
+            status_code=400, detail="Uploaded transcript file is empty."
+        )
 
     history = parse_student_history_html(decode_uploaded_file(raw))
-    existing_plan = students_by_id.get(student_id, StudentProfile(student_id=student_id)).plan
+    existing_plan = students_by_id.get(
+        student_id, StudentProfile(student_id=student_id)
+    ).plan
     students_by_id[student_id] = StudentProfile(
         student_id=student_id,
         history=history,
@@ -534,4 +709,28 @@ def get_student_profile(student_id: str) -> dict[str, Any]:
         "student_id": student.student_id,
         "history": [course.model_dump() for course in student.history],
         "plan": [course.model_dump() for course in student.plan],
+    }
+
+
+@app.get("/api/v1/students/{student_id}/auditreport")
+def get_audit_report(student_id: str, strict: bool = False) -> dict[str, Any]:
+    """Return the Phase 3 academic audit report for one student."""
+
+    student = get_existing_student(student_id)
+    completed_courses = completed_history_by_code(student.history)
+    timeline_validation = build_timeline_validation(student.plan, completed_courses)
+    cross_list_violations = build_cross_list_violations(student.plan, completed_courses)
+    credit_summary = calculate_credit_summary(student.plan, completed_courses)
+
+    has_issues = bool(timeline_validation or cross_list_violations)
+    report_status = "ok"
+    if has_issues:
+        report_status = "failed" if strict else "warning"
+
+    return {
+        "student_id": student.student_id,
+        "status": report_status,
+        "timeline_validation": timeline_validation,
+        "cross_list_violations": cross_list_violations,
+        "credit_summary": credit_summary,
     }

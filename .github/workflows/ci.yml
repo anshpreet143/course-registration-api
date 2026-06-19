@@ -1,0 +1,45 @@
+name: Phase 3 CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Lint with black
+        run: black --check .
+
+      - name: Run tests with coverage
+        run: pytest --cov=main --cov-report=term-missing --cov-fail-under=80
+
+      - name: Run integration smoke test
+        run: |
+          python -m uvicorn main:app --host 127.0.0.1 --port 8000 &
+          SERVER_PID=$!
+          sleep 5
+          curl --fail http://127.0.0.1:8000/
+          curl --fail -F "file=@sample_catalog.html;type=text/html" \
+            http://127.0.0.1:8000/api/v1/admin/catalog/import
+          curl --fail -F "file=@student-example.html;type=text/html" \
+            http://127.0.0.1:8000/api/v1/students/ci-student/history/import
+          curl --fail -X POST http://127.0.0.1:8000/api/v1/students/ci-student/plan \
+            -H "Content-Type: application/json" \
+            -d '{"planned_courses":[{"course_code":"COSC-3506","term":"26F"}]}'
+          curl --fail http://127.0.0.1:8000/api/v1/students/ci-student/auditreport
+          kill $SERVER_PID

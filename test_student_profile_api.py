@@ -89,10 +89,13 @@ def test_unknown_student_routes_return_404() -> None:
 
     assert client.get("/api/v1/students/999/profile").status_code == 404
     assert client.delete("/api/v1/students/999/history").status_code == 404
-    assert client.post(
-        "/api/v1/students/999/plan",
-        json={"planned_courses": [{"course_code": "COSC-3506", "term": "26F"}]},
-    ).status_code == 404
+    assert (
+        client.post(
+            "/api/v1/students/999/plan",
+            json={"planned_courses": [{"course_code": "COSC-3506", "term": "26F"}]},
+        ).status_code
+        == 404
+    )
 
 
 def test_student_profiles_are_isolated() -> None:

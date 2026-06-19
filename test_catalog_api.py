@@ -56,4 +56,3 @@ def test_hidden_style_different_course_code_is_not_hardcoded() -> None:
     assert lookup.json()["course_code"] == "ABCD 1234"
     assert lookup.json()["title"] == "Hidden Test Course"
     assert lookup.json()["credits"] == 4
-
