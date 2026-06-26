@@ -11,6 +11,7 @@ client = TestClient(main.app)
 def reset_state() -> None:
     main.catalog_by_normalized_code.clear()
     main.students_by_id.clear()
+    main.audit_request_times.clear()
 
 
 def import_catalog(html: str) -> None:

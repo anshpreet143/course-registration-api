@@ -1,4 +1,4 @@
-name: Phase 3 CI
+name: Phase 4 CI
 
 on:
   push:
@@ -34,12 +34,25 @@ jobs:
           SERVER_PID=$!
           sleep 5
           curl --fail http://127.0.0.1:8000/
+          curl --fail -X POST http://127.0.0.1:8000/api/v1/auth/register \
+            -H "Content-Type: application/json" \
+            -d '{"username":"ci-student","password":"MyPass1!"}'
+          TOKEN=$(curl --fail -X POST http://127.0.0.1:8000/api/v1/auth/login \
+            -H "Content-Type: application/json" \
+            -d '{"username":"ci-student","password":"MyPass1!"}' \
+            | python -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
           curl --fail -F "file=@sample_catalog.html;type=text/html" \
             http://127.0.0.1:8000/api/v1/admin/catalog/import
           curl --fail -F "file=@student-example.html;type=text/html" \
+            -H "Authorization: Bearer $TOKEN" \
             http://127.0.0.1:8000/api/v1/students/ci-student/history/import
           curl --fail -X POST http://127.0.0.1:8000/api/v1/students/ci-student/plan \
             -H "Content-Type: application/json" \
             -d '{"planned_courses":[{"course_code":"COSC-3506","term":"26F"}]}'
-          curl --fail http://127.0.0.1:8000/api/v1/students/ci-student/audit-report
+          curl --fail -H "Authorization: Bearer $TOKEN" \
+            http://127.0.0.1:8000/api/v1/students/ci-student/profile
+          curl --fail -H "Authorization: Bearer $TOKEN" \
+            http://127.0.0.1:8000/api/v1/students/ci-student/audit-report
+          curl --fail -H "Authorization: Bearer $TOKEN" \
+            http://127.0.0.1:8000/api/v1/students/ci-student/recommendations
           kill $SERVER_PID

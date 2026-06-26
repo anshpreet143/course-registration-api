@@ -10,21 +10,41 @@ client = TestClient(main.app)
 
 def reset_students() -> None:
     main.students_by_id.clear()
+    main.users_by_username.clear()
+    main.audit_request_times.clear()
+    main.seed_admin_user()
+
+
+def auth_header(student_id: str) -> dict[str, str]:
+    register = client.post(
+        "/api/v1/auth/register",
+        json={"username": student_id, "password": "MyPass1!"},
+    )
+    assert register.status_code == 201, register.json()
+
+    login = client.post(
+        "/api/v1/auth/login",
+        json={"username": student_id, "password": "MyPass1!"},
+    )
+    assert login.status_code == 200, login.json()
+    return {"Authorization": f"Bearer {login.json()['access_token']}"}
 
 
 def test_history_import_profile_and_plan_lifecycle() -> None:
     reset_students()
+    headers = auth_header("111")
 
     with open("student-example.html", "rb") as transcript:
         response = client.post(
             "/api/v1/students/111/history/import",
             files={"file": ("student-example.html", transcript, "text/html")},
+            headers=headers,
         )
 
     assert response.status_code == 201, response.json()
     assert response.json() == {"status": "success", "past_courses_imported": 6}
 
-    profile = client.get("/api/v1/students/111/profile")
+    profile = client.get("/api/v1/students/111/profile", headers=headers)
     assert profile.status_code == 200, profile.json()
     assert set(profile.json().keys()) == {"student_id", "history", "plan"}
     assert profile.json()["student_id"] == "111"
@@ -51,7 +71,7 @@ def test_history_import_profile_and_plan_lifecycle() -> None:
     assert plan_response.status_code == 200, plan_response.json()
     assert plan_response.json()["planned_courses_saved"] == 1
 
-    profile_after_plan = client.get("/api/v1/students/111/profile")
+    profile_after_plan = client.get("/api/v1/students/111/profile", headers=headers)
     assert profile_after_plan.json()["plan"] == [
         {"course_code": "COSC-3506", "term": "26F"}
     ]
@@ -70,7 +90,9 @@ def test_history_import_profile_and_plan_lifecycle() -> None:
         },
     )
     assert put_history.status_code == 200, put_history.json()
-    assert client.get("/api/v1/students/111/profile").json()["history"] == [
+    assert client.get("/api/v1/students/111/profile", headers=headers).json()[
+        "history"
+    ] == [
         {
             "course_code": "TEST-1000",
             "term": "26W",
@@ -81,13 +103,18 @@ def test_history_import_profile_and_plan_lifecycle() -> None:
 
     delete_plan = client.delete("/api/v1/students/111/plan")
     assert delete_plan.status_code == 200, delete_plan.json()
-    assert client.get("/api/v1/students/111/profile").json()["plan"] == []
+    assert (
+        client.get("/api/v1/students/111/profile", headers=headers).json()["plan"] == []
+    )
 
 
 def test_unknown_student_routes_return_404() -> None:
     reset_students()
+    headers = auth_header("999")
 
-    assert client.get("/api/v1/students/999/profile").status_code == 404
+    assert (
+        client.get("/api/v1/students/999/profile", headers=headers).status_code == 404
+    )
     assert client.delete("/api/v1/students/999/history").status_code == 404
     assert (
         client.post(
@@ -100,6 +127,8 @@ def test_unknown_student_routes_return_404() -> None:
 
 def test_student_profiles_are_isolated() -> None:
     reset_students()
+    alpha_headers = auth_header("alpha")
+    beta_headers = auth_header("beta")
 
     first_html = """
     <table>
@@ -117,16 +146,18 @@ def test_student_profiles_are_isolated() -> None:
     first_response = client.post(
         "/api/v1/students/alpha/history/import",
         files={"file": ("first.html", first_html.encode("utf-8"), "text/html")},
+        headers=alpha_headers,
     )
     second_response = client.post(
         "/api/v1/students/beta/history/import",
         files={"file": ("second.html", second_html.encode("utf-8"), "text/html")},
+        headers=beta_headers,
     )
     assert first_response.status_code == 201, first_response.json()
     assert second_response.status_code == 201, second_response.json()
 
-    alpha = client.get("/api/v1/students/alpha/profile").json()
-    beta = client.get("/api/v1/students/beta/profile").json()
+    alpha = client.get("/api/v1/students/alpha/profile", headers=alpha_headers).json()
+    beta = client.get("/api/v1/students/beta/profile", headers=beta_headers).json()
 
     assert alpha["history"] == [
         {

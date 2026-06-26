@@ -1,4 +1,4 @@
-"""Course registration API for Project Parts 1, 2, and 3.
+"""Course registration API for Project Parts 1, 2, 3, and 4.
 
 Student Name: Sukhveer Kaur
 Student ID: 5147346
@@ -41,23 +41,52 @@ Part 2:
 
 Part 3:
 
-1. GET /api/v1/students/{student_id}/auditreport
+1. GET /api/v1/students/{student_id}/audit-report
    - Checks planned courses against prerequisite timing rules.
    - Reports cross-listed courses that would duplicate completed credit.
    - Calculates earned, planned, and remaining graduation credits.
+
+Part 4:
+
+1. Authentication and authorization
+   - Registers users with salted bcrypt password hashes.
+   - Logs users in with signed JWT bearer tokens.
+   - Protects student history import with a BOLA owner check.
+   - Protects profile, plan, and recommendations with owner/admin RBAC.
+
+2. Rate limiting and recommendations
+   - Limits audit-report requests to 10 requests per 60 seconds.
+   - Builds a prerequisite-aware graduation pathway with Kahn's algorithm.
 """
 
 from __future__ import annotations
 
 import re
+import time
+import base64
+import hashlib
+import hmac
+import json
+import os
+from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from typing import Any
 
 from bs4 import BeautifulSoup
 from bs4.element import Tag
-from fastapi import FastAPI, File, HTTPException, UploadFile, status
+from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+
+try:
+    import bcrypt
+except ImportError:  # pragma: no cover - used only when local install is unavailable
+    bcrypt = None
+
+try:
+    import jwt
+except ImportError:  # pragma: no cover - used only when local install is unavailable
+    jwt = None
 
 
 app = FastAPI(title="Course Registration and Credit Tracking API")
@@ -65,11 +94,30 @@ app = FastAPI(title="Course Registration and Credit Tracking API")
 
 CourseRecord = dict[str, str | int]
 TranscriptRow = dict[str, str | int]
+JwtClaims = dict[str, Any]
+
+JWT_SECRET = "phase4-course-registration-development-secret"
+JWT_ALGORITHM = "HS256"
+TOKEN_EXPIRE_MINUTES = 120
+ADMIN_USERNAME = "admin"
+ADMIN_PASSWORD = "admin"
+RATE_LIMIT_MAX_REQUESTS = 10
+RATE_LIMIT_WINDOW_SECONDS = 60
+PBKDF2_ITERATIONS = 210_000
 
 
 # In-memory store for the current running process. This is enough for Part 1
 # because the grader imports a catalog and then immediately queries it.
 catalog_by_normalized_code: dict[str, CourseRecord] = {}
+users_by_username: dict[str, dict[str, str]] = {}
+audit_request_times: dict[str, list[float]] = {}
+
+
+class AuthRequest(BaseModel):
+    """Username/password body used for register and login."""
+
+    username: str
+    password: str
 
 
 class PastCourse(BaseModel):
@@ -113,10 +161,235 @@ class StudentProfile(BaseModel):
 students_by_id: dict[str, StudentProfile] = {}
 
 
+def hash_password(password: str) -> str:
+    """Hash a password with bcrypt so plain text is never stored."""
+
+    if bcrypt is not None:
+        return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+    salt = os.urandom(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        PBKDF2_ITERATIONS,
+    )
+    return "pbkdf2_sha256${}${}${}".format(
+        PBKDF2_ITERATIONS,
+        base64.urlsafe_b64encode(salt).decode("ascii"),
+        base64.urlsafe_b64encode(digest).decode("ascii"),
+    )
+
+
+def verify_password(password: str, hashed_password: str) -> bool:
+    """Check a submitted password against the stored bcrypt hash."""
+
+    if hashed_password.startswith("pbkdf2_sha256$"):
+        try:
+            _, iterations, salt_text, digest_text = hashed_password.split("$", 3)
+            salt = base64.urlsafe_b64decode(salt_text.encode("ascii"))
+            expected_digest = base64.urlsafe_b64decode(digest_text.encode("ascii"))
+        except ValueError:
+            return False
+
+        actual_digest = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            salt,
+            int(iterations),
+        )
+        return hmac.compare_digest(actual_digest, expected_digest)
+
+    if bcrypt is None:
+        return False
+
+    return bcrypt.checkpw(password.encode("utf-8"), hashed_password.encode("utf-8"))
+
+
+def seed_admin_user() -> None:
+    """Create the required admin account at startup."""
+
+    if ADMIN_USERNAME not in users_by_username:
+        users_by_username[ADMIN_USERNAME] = {
+            "password_hash": hash_password(ADMIN_PASSWORD),
+            "role": "admin",
+        }
+
+
+seed_admin_user()
+
+
+def create_access_token(username: str, role: str) -> str:
+    """Create a signed JWT containing the student's username and role."""
+
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=TOKEN_EXPIRE_MINUTES)
+    payload = {"sub": username, "role": role, "exp": expires_at}
+
+    if jwt is not None:
+        return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+    return encode_jwt_without_dependency(
+        {
+            "sub": username,
+            "role": role,
+            "exp": int(expires_at.timestamp()),
+        }
+    )
+
+
+def base64url_encode(raw: bytes) -> str:
+    """Encode bytes using the URL-safe JWT base64 variant."""
+
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def base64url_decode(value: str) -> bytes:
+    """Decode the URL-safe JWT base64 variant."""
+
+    padding = "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode((value + padding).encode("ascii"))
+
+
+def encode_jwt_without_dependency(payload: JwtClaims) -> str:
+    """Create a compact HS256 JWT using only the standard library."""
+
+    header = {"alg": JWT_ALGORITHM, "typ": "JWT"}
+    header_text = base64url_encode(json.dumps(header, separators=(",", ":")).encode())
+    payload_text = base64url_encode(json.dumps(payload, separators=(",", ":")).encode())
+    signing_input = f"{header_text}.{payload_text}".encode("ascii")
+    signature = hmac.new(
+        JWT_SECRET.encode("utf-8"),
+        signing_input,
+        hashlib.sha256,
+    ).digest()
+    return f"{header_text}.{payload_text}.{base64url_encode(signature)}"
+
+
+def decode_jwt_without_dependency(token: str) -> JwtClaims:
+    """Validate a compact HS256 JWT using only the standard library."""
+
+    try:
+        header_text, payload_text, signature_text = token.split(".")
+        signing_input = f"{header_text}.{payload_text}".encode("ascii")
+        expected_signature = hmac.new(
+            JWT_SECRET.encode("utf-8"),
+            signing_input,
+            hashlib.sha256,
+        ).digest()
+        actual_signature = base64url_decode(signature_text)
+        if not hmac.compare_digest(actual_signature, expected_signature):
+            raise ValueError("Invalid signature.")
+
+        header = json.loads(base64url_decode(header_text))
+        if header.get("alg") != JWT_ALGORITHM:
+            raise ValueError("Invalid algorithm.")
+
+        claims = json.loads(base64url_decode(payload_text))
+        if int(claims.get("exp", 0)) < int(time.time()):
+            raise ValueError("Expired token.")
+    except (ValueError, json.JSONDecodeError, TypeError) as exc:
+        raise HTTPException(status_code=401, detail="Unauthorized.") from exc
+
+    return claims
+
+
+def bearer_token_from_header(authorization: str | None) -> str:
+    """Extract a bearer token or raise the required 401 response."""
+
+    if authorization is None:
+        raise HTTPException(status_code=401, detail="Unauthorized.")
+
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        raise HTTPException(status_code=401, detail="Unauthorized.")
+
+    return token
+
+
+def decode_token(token: str) -> JwtClaims:
+    """Decode and validate a JWT token."""
+
+    if jwt is None:
+        claims = decode_jwt_without_dependency(token)
+    else:
+        try:
+            claims = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        except jwt.PyJWTError as exc:
+            raise HTTPException(status_code=401, detail="Unauthorized.") from exc
+
+    if not claims.get("sub"):
+        raise HTTPException(status_code=401, detail="Unauthorized.")
+
+    return claims
+
+
+def require_claims(authorization: str | None) -> JwtClaims:
+    """Require a valid Authorization header and return its JWT claims."""
+
+    return decode_token(bearer_token_from_header(authorization))
+
+
+def require_owner(student_id: str, authorization: str | None) -> JwtClaims:
+    """BOLA check: the JWT subject must match the URL student id exactly."""
+
+    claims = require_claims(authorization)
+    if claims.get("sub") != student_id:
+        raise HTTPException(status_code=401, detail="Unauthorized.")
+    return claims
+
+
+def require_owner_or_admin(student_id: str, authorization: str | None) -> JwtClaims:
+    """RBAC check used by profile, plan, and recommendation reads."""
+
+    claims = require_claims(authorization)
+    if claims.get("sub") == student_id or claims.get("role") == "admin":
+        return claims
+    raise HTTPException(status_code=401, detail="Unauthorized.")
+
+
+def optional_rate_limit_key(request: Request, authorization: str | None) -> str:
+    """Use the JWT subject when available, otherwise fall back to client IP."""
+
+    if authorization is not None:
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() == "bearer" and token:
+            try:
+                claims = decode_token(token)
+                return f"user:{claims['sub']}"
+            except HTTPException:
+                pass
+
+    client_host = request.client.host if request.client is not None else "unknown"
+    return f"ip:{client_host}"
+
+
+def enforce_audit_rate_limit(request: Request, authorization: str | None) -> None:
+    """Allow only ten audit requests in any sliding 60-second window."""
+
+    key = optional_rate_limit_key(request, authorization)
+    now = time.time()
+    recent_requests = [
+        seen_at
+        for seen_at in audit_request_times.get(key, [])
+        if now - seen_at < RATE_LIMIT_WINDOW_SECONDS
+    ]
+
+    if len(recent_requests) >= RATE_LIMIT_MAX_REQUESTS:
+        audit_request_times[key] = recent_requests
+        raise HTTPException(status_code=429, detail="Too many requests.")
+
+    recent_requests.append(now)
+    audit_request_times[key] = recent_requests
+
+
 def normalize_course_code(course_code: str) -> str:
     """Normalize course codes so COSC3506 and COSC 3506 match the same record."""
 
-    return re.sub(r"[^A-Z0-9]", "", course_code.upper())
+    cleaned = course_code.upper()
+    match = re.search(r"\b([A-Z]{3,5})[-\s]?(\d{4})\b", cleaned)
+    if match is not None:
+        return f"{match.group(1)}{match.group(2)}"
+    return re.sub(r"[^A-Z0-9]", "", cleaned)
 
 
 def clean_text(value: str) -> str:
@@ -422,6 +695,33 @@ def parse_term_order(term: str) -> tuple[int, int]:
     return (int(match.group(1)), season_order[match.group(2)])
 
 
+def term_after(term: str) -> str:
+    """Return the next normal academic term after a given term."""
+
+    year, season = parse_term_order(term)
+    if year == 9999:
+        return "26F"
+
+    label_by_order = {1: "SP", 2: "F", 3: "F", 4: "W"}
+    next_year = year + 1 if season == 4 else year
+    return f"{next_year:02d}{label_by_order[season]}"
+
+
+def first_recommendation_term(student: StudentProfile) -> str:
+    """Start recommendations after the latest known history or planned term."""
+
+    known_terms = [course.term for course in student.history] + [
+        course.term for course in student.plan
+    ]
+    ordered_terms = [
+        term for term in known_terms if parse_term_order(term) != (9999, 9999)
+    ]
+    if not ordered_terms:
+        return "26F"
+
+    return term_after(max(ordered_terms, key=parse_term_order))
+
+
 def completed_history_by_code(history: list[PastCourse]) -> dict[str, PastCourse]:
     """Keep one completed record per course, using the latest completed term."""
 
@@ -641,6 +941,78 @@ def calculate_credit_summary(
     }
 
 
+def build_recommended_pathway(student: StudentProfile) -> list[dict[str, Any]]:
+    """Compute remaining catalog courses using Kahn's topological sort."""
+
+    completed_codes = set(completed_history_by_code(student.history).keys())
+    remaining_courses = {
+        code: course
+        for code, course in catalog_by_normalized_code.items()
+        if code not in completed_codes
+    }
+
+    indegree = {code: 0 for code in remaining_courses}
+    dependents: dict[str, list[str]] = {code: [] for code in remaining_courses}
+
+    for course_key, course in remaining_courses.items():
+        for prerequisite in extract_course_codes(str(course["prerequisites"])):
+            prerequisite_key = normalize_course_code(prerequisite)
+            if prerequisite_key in completed_codes:
+                continue
+            if prerequisite_key in remaining_courses:
+                indegree[course_key] += 1
+                dependents[prerequisite_key].append(course_key)
+
+    available = sorted(
+        [code for code, count in indegree.items() if count == 0],
+        key=lambda code: str(remaining_courses[code]["course_code"]),
+    )
+    pathway: list[dict[str, Any]] = []
+    scheduled: set[str] = set()
+    term = first_recommendation_term(student)
+
+    while available:
+        current_level = available
+        available = []
+        scheduled.update(current_level)
+
+        pathway.append(
+            {
+                "term": term,
+                "courses": [
+                    str(remaining_courses[code]["course_code"])
+                    for code in current_level
+                ],
+            }
+        )
+
+        for course_key in current_level:
+            for dependent in dependents[course_key]:
+                indegree[dependent] -= 1
+                if indegree[dependent] == 0:
+                    available.append(dependent)
+
+        available.sort(key=lambda code: str(remaining_courses[code]["course_code"]))
+        term = term_after(term)
+
+    blocked_courses = sorted(
+        [code for code in remaining_courses if code not in scheduled],
+        key=lambda code: str(remaining_courses[code]["course_code"]),
+    )
+    if blocked_courses:
+        pathway.append(
+            {
+                "term": term,
+                "courses": [
+                    str(remaining_courses[code]["course_code"])
+                    for code in blocked_courses
+                ],
+            }
+        )
+
+    return pathway
+
+
 @app.get("/")
 def root() -> dict[str, Any]:
     """Simple reachability endpoint for Render/browser wake-up."""
@@ -652,7 +1024,39 @@ def root() -> dict[str, Any]:
         "lookup_endpoint": "/api/v1/catalog/courses/{course_code}",
         "student_profile_endpoint": "/api/v1/students/{student_id}/profile",
         "audit_report_endpoint": "/api/v1/students/{student_id}/audit-report",
+        "recommendations_endpoint": "/api/v1/students/{student_id}/recommendations",
     }
+
+
+@app.post("/api/v1/auth/register", status_code=status.HTTP_201_CREATED)
+def register_user(body: AuthRequest) -> dict[str, str]:
+    """Register a user account with a salted password hash."""
+
+    username = clean_text(body.username)
+    if not username or not body.password:
+        raise HTTPException(status_code=400, detail="Username and password required.")
+
+    if username in users_by_username:
+        raise HTTPException(status_code=409, detail="Username already exists.")
+
+    users_by_username[username] = {
+        "password_hash": hash_password(body.password),
+        "role": "user",
+    }
+    return {"status": "registered"}
+
+
+@app.post("/api/v1/auth/login")
+def login_user(body: AuthRequest) -> dict[str, str]:
+    """Verify credentials and return a signed bearer token."""
+
+    username = clean_text(body.username)
+    user = users_by_username.get(username)
+    if user is None or not verify_password(body.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Bad credentials.")
+
+    token = create_access_token(username, user["role"])
+    return {"access_token": token, "token_type": "bearer"}
 
 
 @app.post("/api/v1/admin/catalog/import")
@@ -703,9 +1107,13 @@ def get_course(course_code: str) -> JSONResponse:
     status_code=status.HTTP_201_CREATED,
 )
 async def import_student_history(
-    student_id: str, file: UploadFile = File(...)
+    student_id: str,
+    file: UploadFile = File(...),
+    authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     """Import one student's transcript HTML and create or replace their history."""
+
+    require_owner(student_id, authorization)
 
     raw = await file.read()
     if not raw:
@@ -772,9 +1180,12 @@ def clear_student_plan(student_id: str) -> dict[str, str]:
 
 
 @app.get("/api/v1/students/{student_id}/profile")
-def get_student_profile(student_id: str) -> dict[str, Any]:
+def get_student_profile(
+    student_id: str, authorization: str | None = Header(default=None)
+) -> dict[str, Any]:
     """Return exactly the three top-level keys required by Phase 2."""
 
+    require_owner_or_admin(student_id, authorization)
     student = get_existing_student(student_id)
     return {
         "student_id": student.student_id,
@@ -783,11 +1194,31 @@ def get_student_profile(student_id: str) -> dict[str, Any]:
     }
 
 
+@app.get("/api/v1/students/{student_id}/plan")
+def get_student_plan(
+    student_id: str, authorization: str | None = Header(default=None)
+) -> dict[str, Any]:
+    """Return a protected copy of one student's planned courses."""
+
+    require_owner_or_admin(student_id, authorization)
+    student = get_existing_student(student_id)
+    return {
+        "student_id": student.student_id,
+        "planned_courses": [course.model_dump() for course in student.plan],
+    }
+
+
 @app.get("/api/v1/students/{student_id}/audit-report")
 @app.get("/api/v1/students/{student_id}/auditreport")
-def get_audit_report(student_id: str, strict: bool = False) -> dict[str, Any]:
+def get_audit_report(
+    student_id: str,
+    request: Request,
+    strict: bool = False,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
     """Return the Phase 3 academic audit report for one student."""
 
+    enforce_audit_rate_limit(request, authorization)
     student = get_existing_student(student_id)
     completed_courses = completed_history_by_code(student.history)
     timeline_validation = build_timeline_validation(student.plan, completed_courses)
@@ -805,4 +1236,18 @@ def get_audit_report(student_id: str, strict: bool = False) -> dict[str, Any]:
         "timeline_validation": timeline_validation,
         "cross_list_violations": cross_list_violations,
         "credit_summary": credit_summary,
+    }
+
+
+@app.get("/api/v1/students/{student_id}/recommendations")
+def get_recommendations(
+    student_id: str, authorization: str | None = Header(default=None)
+) -> dict[str, Any]:
+    """Return a prerequisite-aware graduation pathway for a student."""
+
+    require_owner_or_admin(student_id, authorization)
+    student = get_existing_student(student_id)
+    return {
+        "student_id": student.student_id,
+        "recommended_pathway": build_recommended_pathway(student),
     }
